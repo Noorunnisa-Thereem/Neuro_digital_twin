@@ -1,0 +1,481 @@
+"""Live ClinicalTrials.gov lookups via the public API v2.
+
+One call: ``GET /api/v2/studies?query.cond=<condition>&query.intr=<drug>``.
+Field shape (``protocolSection.identificationModule.nctId``/``briefTitle``,
+``statusModule.overallStatus``, ``designModule.phases``) confirmed against
+a live call during development.
+
+Before the HTTP call, ``memory_store.recall_or_compute`` checks the
+long-term memory store (keyed by the condition+drug pair, 30-day TTL) --
+see ``memory_store.py``.
+
+Study results (``fetch_trial_outcome_summary``)
+--------------------------------------------------
+``search_trials``/``search_trials_drug_pair`` above only ever return a study
+*pointer* (NCT ID, title, status) -- a real, observed bug downstream (see
+``ddi_flag_evidence.py``) used a study's ``briefTitle`` as if it were the
+pair's actual finding. A title states the study's *aim*, not its *result* --
+confirmed live against NCT01111552 (an Aripiprazole+Citalopram/Escitalopram
+trial), whose title names a different drug (Escitalopram) than the pair
+being screened (Citalopram) even though both are genuinely listed as real
+interventions. ``fetch_trial_outcome_summary`` fetches the single-study
+endpoint (``GET /api/v2/studies/{nct_id}``, confirmed live to include a
+``hasResults`` flag and, when true, a rich ``resultsSection.
+outcomeMeasuresModule`` -- per-arm group titles, measured values, and
+p-values) and builds a real, source-grounded summary of the primary outcome:
+
+- ``hasResults`` false (the common case) -> reported honestly as results not
+  yet posted, never silently treated as "no interaction."
+- ``hasResults`` true -> the primary outcome's own comparison between
+  whichever arm's title names both screened drugs (the combination arm) and
+  a comparator arm, with the p-value and whether it crosses the
+  conventional p<0.05 significance threshold -- both objectively computable
+  from the structured ``analyses`` field. This module deliberately does NOT
+  infer a clinical direction ("improved"/"worsened") from the sign of a
+  measured value -- confirmed live (NCT01111552) that which direction is
+  "better" for a given outcome scale lives only in inconsistent free-text
+  description prose, not a structured flag; inventing that call from
+  arithmetic alone would be exactly the kind of guess this codebase's
+  sources are built to avoid. A direction is only ever included when the
+  outcome's own description explicitly states one, quoted, never inferred.
+- Groups/analyses that can't be confidently matched to the two screened
+  drugs are reported as "results posted, comparison not confidently
+  identified," never a fabricated comparison.
+"""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+from typing import Any
+
+from . import memory_store
+from .guardrails import sanitize_response_field, validate_query_term, validate_source_url
+from .http_client import DEFAULT_CACHE_DIR, build_envelope, fetch_json
+
+RESOURCE_NAME = "ClinicalTrials.gov (API v2)"
+_STUDIES_URL = "https://clinicaltrials.gov/api/v2/studies"
+_STUDY_URL = "https://clinicaltrials.gov/api/v2/studies/{nct_id}"
+_EXPECTED_DOMAIN = "clinicaltrials.gov"
+_REMEMBER_STATUSES = frozenset({"ok", "no_results"})
+
+_OUTCOME_RESOURCE_NAME = "ClinicalTrials.gov study results (API v2)"
+_DIRECTION_SENTENCE_RE = re.compile(
+    r"[^.]*\b(?:indicat\w*|higher scores?|lower scores?)\b[^.]*\.", re.IGNORECASE
+)
+
+
+def search_trials(
+    condition: str,
+    drug_name: str | None = None,
+    *,
+    page_size: int = 5,
+    cache_dir: Path = DEFAULT_CACHE_DIR,
+    refresh: bool = False,
+    memory_path: Path = memory_store.DEFAULT_STORE_PATH,
+) -> dict[str, Any]:
+    """Search ClinicalTrials.gov for studies matching ``condition`` (and,
+    when given, also filtered to studies mentioning ``drug_name`` as an
+    intervention)."""
+    condition = validate_query_term(condition, field_name="condition")
+    if drug_name:
+        drug_name = validate_query_term(drug_name, field_name="drug_name")
+    memory_term = f"{condition}|{drug_name or ''}"
+
+    def _live_lookup() -> dict[str, Any]:
+        params = f"query.cond={_quote(condition)}&pageSize={int(page_size)}&format=json&countTotal=true"
+        if drug_name:
+            params += f"&query.intr={_quote(drug_name)}"
+        endpoint = f"{_STUDIES_URL}?{params}"
+        fetch_result = fetch_json(endpoint, cache_dir=cache_dir, refresh=refresh)
+
+        query = {"condition": condition, "drug_name": drug_name, "page_size": page_size}
+        if fetch_result.get("error") is not None:
+            return build_envelope(resource=RESOURCE_NAME, endpoint=endpoint, query=query, fetch_result=fetch_result, records=[])
+
+        studies = (fetch_result.get("body") or {}).get("studies", [])
+        total_count = (fetch_result.get("body") or {}).get("totalCount")
+        # query.cond/query.intr already scope the search server-side, but this never trusts
+        # that scoping blindly (confirmed live: a "Focal impaired-awareness seizures" +
+        # "Levetiracetam" query returned a genuinely on-topic epilepsy trial alongside a
+        # cancer-context trial whose only real link was a shared "Seizures" condition token
+        # and an incidental levetiracetam arm) -- each study's own structured
+        # armsInterventionsModule/conditionsModule is checked before it is shown as a match.
+        relevant_studies = [
+            study
+            for study in studies
+            if isinstance(study, dict)
+            and _record_intervention_matches(study, drug_name)
+            and _record_condition_overlaps(study, condition)
+        ]
+        records = [_trial_record(study) for study in relevant_studies]
+
+        envelope = build_envelope(resource=RESOURCE_NAME, endpoint=endpoint, query=query, fetch_result=fetch_result, records=records)
+        envelope["total_matches_on_clinicaltrials_gov"] = total_count
+        return envelope
+
+    return memory_store.recall_or_compute(
+        RESOURCE_NAME,
+        memory_term,
+        _live_lookup,
+        store_path=memory_path,
+        refresh=refresh,
+        remember_statuses=_REMEMBER_STATUSES,
+    )
+
+
+def search_trials_drug_pair(
+    drug_a: str,
+    drug_b: str,
+    *,
+    page_size: int = 5,
+    cache_dir: Path = DEFAULT_CACHE_DIR,
+    refresh: bool = False,
+    memory_path: Path = memory_store.DEFAULT_STORE_PATH,
+) -> dict[str, Any]:
+    """Search ClinicalTrials.gov for studies whose structured interventions
+    genuinely include BOTH ``drug_a`` and ``drug_b`` -- a real drug-pair
+    query (no ``condition`` needed), the same combined-query shape
+    ``pubmed_lookup.search_pubmed_drug_pair`` already uses for PubMed.
+
+    Same never-trust-the-raw-match discipline ``search_trials`` itself
+    already applies: ``query.intr=DrugA AND DrugB`` scopes the search
+    server-side (confirmed live it returns real studies), but a study is
+    only kept when its own structured ``armsInterventionsModule`` lists
+    BOTH drugs as real interventions -- a study that merely mentions one of
+    them, or names both only in an unrelated field, is dropped, not shown
+    as a match."""
+    drug_a = validate_query_term(drug_a, field_name="drug_a")
+    drug_b = validate_query_term(drug_b, field_name="drug_b")
+    memory_term = f"{drug_a}|{drug_b}"
+
+    def _live_lookup() -> dict[str, Any]:
+        params = f"query.intr={_quote(f'{drug_a} AND {drug_b}')}&pageSize={int(page_size)}&format=json&countTotal=true"
+        endpoint = f"{_STUDIES_URL}?{params}"
+        fetch_result = fetch_json(endpoint, cache_dir=cache_dir, refresh=refresh)
+        query = {"drug_a": drug_a, "drug_b": drug_b, "page_size": page_size}
+
+        if fetch_result.get("error") is not None:
+            return build_envelope(resource=RESOURCE_NAME, endpoint=endpoint, query=query, fetch_result=fetch_result, records=[])
+
+        studies = (fetch_result.get("body") or {}).get("studies", [])
+        total_count = (fetch_result.get("body") or {}).get("totalCount")
+        relevant_studies = [
+            study
+            for study in studies
+            if isinstance(study, dict) and _record_intervention_matches(study, drug_a) and _record_intervention_matches(study, drug_b)
+        ]
+        records = [_trial_record(study) for study in relevant_studies]
+
+        envelope = build_envelope(resource=RESOURCE_NAME, endpoint=endpoint, query=query, fetch_result=fetch_result, records=records)
+        envelope["total_matches_on_clinicaltrials_gov"] = total_count
+        return envelope
+
+    return memory_store.recall_or_compute(
+        RESOURCE_NAME,
+        memory_term,
+        _live_lookup,
+        store_path=memory_path,
+        refresh=refresh,
+        remember_statuses=_REMEMBER_STATUSES,
+    )
+
+
+_CONDITION_STOPWORDS = frozenset(
+    {"and", "the", "with", "from", "for", "of", "in", "on", "to", "adult", "adults", "patients", "patient"}
+)
+
+
+def _condition_tokens(text: str) -> set[str]:
+    words = re.findall(r"[a-z0-9]+", text.lower())
+    return {w for w in words if len(w) > 3 and w not in _CONDITION_STOPWORDS}
+
+
+def _record_intervention_matches(study: dict[str, Any], drug_name: str | None) -> bool:
+    """True if ``drug_name`` genuinely appears as a structured intervention
+    on this study -- not merely because the API's own ``query.intr`` said so.
+    When no ``drug_name`` was requested, every study passes (nothing to
+    verify).
+
+    Word-boundary matched, not a plain substring check -- a real, observed
+    bug otherwise: a study whose only real interventions were "Escitalopram"
+    and "Aripiprazole" (confirmed live, NCT01111552) matched a "Citalopram"
+    query, because "citalopram" is a plain substring of "escitalopram" even
+    though they are two different drugs. Same discipline
+    ``dailymed_lookup._title_names_drug`` already applies for the same
+    reason (its own docstring: "depa" matching "department")."""
+    if not drug_name:
+        return True
+    arms = (study.get("protocolSection") or {}).get("armsInterventionsModule") or {}
+    interventions = arms.get("interventions")
+    if not isinstance(interventions, list):
+        return False
+    pattern = re.compile(r"\b" + re.escape(drug_name.strip().lower()) + r"\b")
+    return any(isinstance(iv, dict) and pattern.search(str(iv.get("name") or "").lower()) for iv in interventions)
+
+
+def _record_condition_overlaps(study: dict[str, Any], condition: str) -> bool:
+    """True if this study's own ``conditionsModule.conditions`` shares at
+    least one meaningful word with the queried ``condition`` -- rejects a
+    trial whose only real link to the query is an unrelated condition list
+    (confirmed live: a "Seizures"-labeled cancer trial surfaced for a
+    "Focal impaired-awareness seizures" query via keyword overlap alone,
+    while sharing no other clinical context with the patient's epilepsy
+    diagnosis). This is a coarse word-overlap heuristic, not clinical
+    judgment -- it cannot and does not try to distinguish "Partial Seizures"
+    from "Seizures" in an unrelated oncology context; it only rejects
+    conditions with zero token overlap at all. A study missing structured
+    condition data is passed through rather than rejected, since there is
+    nothing here to verify against."""
+    conditions = ((study.get("protocolSection") or {}).get("conditionsModule") or {}).get("conditions")
+    if not isinstance(conditions, list) or not conditions:
+        return True
+    query_tokens = _condition_tokens(condition)
+    if not query_tokens:
+        return True
+    return any(isinstance(c, str) and _condition_tokens(c) & query_tokens for c in conditions)
+
+
+def _trial_record(study: dict[str, Any]) -> dict[str, Any]:
+    """Build one output record, running every third-party text field through
+    sanitize_response_field and the URL through validate_source_url before
+    either ever reaches External_Evidence_Report.json or a rendered report."""
+    protocol = study.get("protocolSection") or {}
+    identification = protocol.get("identificationModule") or {}
+    status_module = protocol.get("statusModule") or {}
+    design_module = protocol.get("designModule") or {}
+
+    conditions_module = protocol.get("conditionsModule") or {}
+
+    clean_nct_id = sanitize_response_field(identification.get("nctId"), max_length=20) or None
+    url = validate_source_url(f"https://clinicaltrials.gov/study/{clean_nct_id}", _EXPECTED_DOMAIN) if clean_nct_id else None
+    phases = design_module.get("phases")
+    clean_phases = (
+        [sanitize_response_field(p, max_length=40) for p in phases if isinstance(p, str)]
+        if isinstance(phases, list)
+        else None
+    )
+    conditions = conditions_module.get("conditions")
+    clean_conditions = (
+        [sanitize_response_field(c, max_length=200) for c in conditions if isinstance(c, str)]
+        if isinstance(conditions, list)
+        else None
+    )
+    return {
+        "nct_id": clean_nct_id,
+        "url": url,
+        "brief_title": sanitize_response_field(identification.get("briefTitle")) or None,
+        "overall_status": sanitize_response_field(status_module.get("overallStatus"), max_length=60) or None,
+        "phases": [p for p in clean_phases if p] if clean_phases is not None else None,
+        "conditions": [c for c in clean_conditions if c] if clean_conditions is not None else None,
+    }
+
+
+def fetch_trial_outcome_summary(
+    nct_id: str,
+    drug_a: str,
+    drug_b: str,
+    *,
+    cache_dir: Path = DEFAULT_CACHE_DIR,
+    refresh: bool = False,
+    memory_path: Path = memory_store.DEFAULT_STORE_PATH,
+) -> dict[str, Any]:
+    """Fetch one study's real results (see module docstring) and summarize
+    its primary outcome as it applies to ``drug_a``/``drug_b``, or report
+    honestly that results are not posted / not confidently identifiable.
+
+    Returns a standard envelope. ``records[0]`` is always present when the
+    fetch itself succeeds, with:
+      - ``results_posted``: bool, straight from the study's own ``hasResults``.
+      - ``summary``: a real, source-grounded sentence (never fabricated) when
+        results are posted AND a combination-vs-comparator analysis was
+        confidently identified; ``None`` otherwise.
+      - ``note``: always populated when ``summary`` is ``None``, explaining
+        why (not posted, or not confidently identifiable) -- never left
+        implicit.
+    """
+    clean_id = sanitize_response_field(nct_id, max_length=20)
+    clean_a = sanitize_response_field(drug_a, max_length=80) or drug_a
+    clean_b = sanitize_response_field(drug_b, max_length=80) or drug_b
+    if not clean_id:
+        return build_envelope(
+            resource=_OUTCOME_RESOURCE_NAME,
+            endpoint="",
+            query={"nct_id": nct_id},
+            fetch_result={"error": "empty or invalid nct_id", "retrieved_at": None, "from_cache": False, "http_status": None},
+            records=[],
+        )
+
+    def _live_lookup() -> dict[str, Any]:
+        endpoint = _STUDY_URL.format(nct_id=clean_id)
+        fetch_result = fetch_json(endpoint, cache_dir=cache_dir, refresh=refresh)
+        query = {"nct_id": clean_id, "drug_a": clean_a, "drug_b": clean_b}
+
+        if fetch_result.get("error") is not None:
+            return build_envelope(resource=_OUTCOME_RESOURCE_NAME, endpoint=endpoint, query=query, fetch_result=fetch_result, records=[])
+
+        body = fetch_result.get("body") or {}
+        url = validate_source_url(f"https://clinicaltrials.gov/study/{clean_id}", _EXPECTED_DOMAIN)
+
+        if not body.get("hasResults"):
+            record = {
+                "nct_id": clean_id,
+                "url": url,
+                "results_posted": False,
+                "summary": None,
+                "note": f"Results for {clean_id} have not been posted to ClinicalTrials.gov as of this check.",
+            }
+            return build_envelope(resource=_OUTCOME_RESOURCE_NAME, endpoint=endpoint, query=query, fetch_result=fetch_result, records=[record])
+
+        summary, note = _summarize_primary_outcome(body, clean_a, clean_b, clean_id)
+        record = {"nct_id": clean_id, "url": url, "results_posted": True, "summary": summary, "note": note}
+        return build_envelope(resource=_OUTCOME_RESOURCE_NAME, endpoint=endpoint, query=query, fetch_result=fetch_result, records=[record])
+
+    return memory_store.recall_or_compute(
+        _OUTCOME_RESOURCE_NAME,
+        f"{clean_id}|{clean_a}|{clean_b}",
+        _live_lookup,
+        store_path=memory_path,
+        refresh=refresh,
+        remember_statuses=_REMEMBER_STATUSES,
+    )
+
+
+def _name_in_title(name: str, lowered_title: str) -> bool:
+    """Word-boundary match, not a plain substring check -- same fix, same
+    reason as ``_record_intervention_matches`` (e.g. "citalopram" must not
+    match inside "escitalopram")."""
+    return re.search(r"\b" + re.escape(name.strip().lower()) + r"\b", lowered_title) is not None
+
+
+def _matching_group_id(groups: list[dict[str, Any]], *, needs_both: tuple[str, str] | None = None, needs_one_of: tuple[str, str] | None = None, exclude_id: str | None = None) -> tuple[str, str] | None:
+    """Returns (groupId, title) for the first group whose title matches the
+    given name requirement, or ``None``. Title matching is word-boundary
+    matched against the group's own real title text (see ``_name_in_title``)."""
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        gid = group.get("id")
+        title = str(group.get("title") or "")
+        lowered = title.lower()
+        if exclude_id is not None and gid == exclude_id:
+            continue
+        if needs_both is not None:
+            if all(_name_in_title(name, lowered) for name in needs_both):
+                return gid, title
+        elif needs_one_of is not None:
+            matches = [_name_in_title(name, lowered) for name in needs_one_of]
+            if any(matches) and not all(matches):
+                return gid, title
+    return None
+
+
+def _parse_p_value(raw: Any) -> tuple[float, str] | None:
+    """(numeric value, operator) from a real ``analyses[].pValue`` string
+    (e.g. "=0.595", "<0.001") or ``None`` if unparseable -- never guessed."""
+    if not isinstance(raw, str):
+        return None
+    match = re.match(r"\s*(?P<op>[<>=]?)\s*(?P<val>\d*\.?\d+)", raw)
+    if not match:
+        return None
+    try:
+        return float(match.group("val")), (match.group("op") or "=")
+    except ValueError:
+        return None
+
+
+def _significance_phrase(p_value: float, op: str) -> str | None:
+    """A plain-language significance statement, only when unambiguously
+    determinable from the reported value+operator (see module docstring --
+    this never infers a clinical direction, only whether the conventional
+    p<0.05 threshold was crossed, which is objective arithmetic on a number
+    the trial itself reported)."""
+    if op in ("", "="):
+        return "was statistically significant" if p_value < 0.05 else "was not statistically significant"
+    if op == "<" and p_value <= 0.05:
+        return "was statistically significant"
+    if op == ">" and p_value >= 0.05:
+        return "was not statistically significant"
+    return None  # ambiguous (e.g. ">0.02") -- state the raw value only, never guess
+
+
+def _summarize_primary_outcome(body: dict[str, Any], drug_a: str, drug_b: str, nct_id: str) -> tuple[str | None, str]:
+    """(summary, note) for the study's primary outcome, comparing whichever
+    arm's own title names both screened drugs against a comparator arm --
+    see module docstring for what this deliberately does and does not
+    claim. ``summary`` is ``None`` when no confident combination-vs-
+    comparator match exists; ``note`` always explains the outcome either
+    way."""
+    outcomes = ((body.get("resultsSection") or {}).get("outcomeMeasuresModule") or {}).get("outcomeMeasures")
+    if not isinstance(outcomes, list) or not outcomes:
+        return None, f"{nct_id} has posted results, but no outcome measures were found in its structured data."
+
+    primary = next((o for o in outcomes if isinstance(o, dict) and o.get("type") == "PRIMARY" and o.get("reportingStatus") == "POSTED"), None)
+    outcome = primary or next((o for o in outcomes if isinstance(o, dict) and o.get("reportingStatus") == "POSTED"), None)
+    if outcome is None:
+        return None, f"{nct_id} has posted results, but no outcome measure in its structured data is itself marked as posted."
+
+    groups = outcome.get("groups")
+    if not isinstance(groups, list) or len(groups) < 2:
+        return None, f"{nct_id} has posted results for '{sanitize_response_field(outcome.get('title'), max_length=200)}', but its arm groups could not be confidently identified from structured data."
+
+    combo = _matching_group_id(groups, needs_both=(drug_a, drug_b))
+    if combo is None:
+        return None, f"{nct_id} has posted results, but no arm group's own title names both {drug_a} and {drug_b} together -- a combination-vs-comparator comparison could not be confidently identified."
+    combo_id, combo_title = combo
+
+    comparator = _matching_group_id(groups, needs_one_of=(drug_a, drug_b), exclude_id=combo_id)
+    if comparator is None:
+        # fall back to any other group -- still real, still cited by its own title, just not
+        # guaranteed to be a single-drug monotherapy arm specifically.
+        comparator = next(((g.get("id"), str(g.get("title") or "")) for g in groups if isinstance(g, dict) and g.get("id") != combo_id), None)
+    if comparator is None:
+        return None, f"{nct_id} has posted results naming a {drug_a}+{drug_b} combination arm ('{combo_title}'), but no comparator arm could be identified."
+    comparator_id, comparator_title = comparator
+
+    analyses = outcome.get("analyses")
+    analysis = None
+    if isinstance(analyses, list):
+        for a in analyses:
+            if isinstance(a, dict) and isinstance(a.get("groupIds"), list) and set(a["groupIds"]) == {combo_id, comparator_id}:
+                analysis = a
+                break
+
+    outcome_title = sanitize_response_field(outcome.get("title"), max_length=250) or "the study's primary outcome"
+    combo_title_clean = sanitize_response_field(combo_title, max_length=150) or "the combination arm"
+    comparator_title_clean = sanitize_response_field(comparator_title, max_length=150) or "a comparator arm"
+
+    # A direction is only ever stated when the outcome's own description explicitly says one,
+    # quoted verbatim -- never inferred from the sign of a measured value (see module docstring).
+    description = str(outcome.get("description") or "")
+    direction_match = _DIRECTION_SENTENCE_RE.search(description)
+    direction_clause = f" The outcome's own description notes: \"{sanitize_response_field(direction_match.group(0).strip(), max_length=300)}\"" if direction_match else ""
+
+    if analysis is None:
+        note = f"{nct_id} posted results for '{outcome_title}' comparing {combo_title_clean} to {comparator_title_clean}, but no statistical comparison between exactly those two arms was found in its structured analyses."
+        return None, note
+
+    parsed = _parse_p_value(analysis.get("pValue"))
+    if parsed is None:
+        note = f"{nct_id} posted results for '{outcome_title}' comparing {combo_title_clean} to {comparator_title_clean}, but no parseable p-value was reported for that comparison."
+        return None, note
+
+    p_value, op = parsed
+    significance = _significance_phrase(p_value, op)
+    if significance is not None:
+        summary = (
+            f"In {nct_id}, the primary outcome ('{outcome_title}') compared {combo_title_clean} against "
+            f"{comparator_title_clean}; the difference {significance} (p{op}{p_value})." + direction_clause
+        )
+    else:
+        summary = (
+            f"In {nct_id}, the primary outcome ('{outcome_title}') compared {combo_title_clean} against "
+            f"{comparator_title_clean}, reporting p{op}{p_value} (see the trial directly for statistical interpretation)." + direction_clause
+        )
+    return sanitize_response_field(summary, max_length=900), f"Sourced from {nct_id}'s own posted results."
+
+
+def _quote(term: str) -> str:
+    from urllib.parse import quote
+
+    return quote(term, safe="")
